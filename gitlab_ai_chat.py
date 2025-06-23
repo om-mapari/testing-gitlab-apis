@@ -28,6 +28,7 @@ class GitLabConfig:
     """Configuration for connecting to GitLab"""
     gitlab_url: str
     access_token: str
+    debug: bool = False
 
 
 class GitLabAIChat:
@@ -45,9 +46,19 @@ class GitLabAIChat:
         self.thread_id = None
         self.request_ids = []
         self.gitlab_version = None
+        self.debug = config.debug
+        
+    def _debug_print(self, *args, **kwargs):
+        """Print debug information if debug mode is enabled"""
+        if self.debug:
+            print("[DEBUG]", *args, **kwargs)
         
     def _graphql_request(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         """Make a GraphQL request to GitLab API"""
+        if self.debug:
+            self._debug_print(f"GraphQL Query: {query}")
+            self._debug_print(f"Variables: {json.dumps(variables, indent=2)}")
+            
         try:
             response = requests.post(
                 self.graphql_url,
@@ -56,8 +67,17 @@ class GitLabAIChat:
                 verify=False  # Disable SSL verification
             )
             
+            if self.debug:
+                self._debug_print(f"Response Status: {response.status_code}")
+                self._debug_print(f"Response Headers: {response.headers}")
+                
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            
+            if self.debug:
+                self._debug_print(f"Response Data: {json.dumps(data, indent=2)}")
+                
+            return data
         except requests.RequestException as e:
             print(f"Request error: {e}")
             if hasattr(e, 'response') and e.response:
@@ -70,9 +90,27 @@ class GitLabAIChat:
         if self.gitlab_version:
             return self.gitlab_version
             
+        # First try the version field directly
         query = """
         query getVersion {
           version
+        }
+        """
+        
+        data = self._graphql_request(query, {})
+        
+        if "errors" not in data:
+            version = data.get("data", {}).get("version")
+            if version:
+                self.gitlab_version = version
+                return version
+                
+        # If that fails, try the metadata.version field
+        query = """
+        query getMetadataVersion {
+          metadata {
+            version
+          }
         }
         """
         
@@ -82,7 +120,7 @@ class GitLabAIChat:
             print(f"Error getting GitLab version: {data['errors']}")
             return None
             
-        version = data.get("data", {}).get("version")
+        version = data.get("data", {}).get("metadata", {}).get("version")
         self.gitlab_version = version
         return version
 
@@ -124,6 +162,29 @@ class GitLabAIChat:
             
         return data.get("data", {}).get("currentUser")
 
+    def get_available_conversation_types(self) -> List[str]:
+        """Get the available conversation types for the current GitLab instance"""
+        # Try to introspect the GraphQL schema to get available enum values
+        query = """
+        query getConversationTypes {
+          __type(name: "AiConversationsThreadsConversationType") {
+            enumValues {
+              name
+            }
+          }
+        }
+        """
+        
+        data = self._graphql_request(query, {})
+        
+        if "errors" in data:
+            self._debug_print(f"Error getting conversation types: {data['errors']}")
+            # Default to DUO_CHAT_LEGACY as fallback
+            return ["DUO_CHAT_LEGACY"]
+            
+        enum_values = data.get("data", {}).get("__type", {}).get("enumValues", [])
+        return [enum_value["name"] for enum_value in enum_values] if enum_values else ["DUO_CHAT_LEGACY"]
+
     def send_message(self, message: str) -> Optional[str]:
         """
         Send a message to GitLab AI chat and return the response
@@ -132,7 +193,18 @@ class GitLabAIChat:
         
         # Get version to determine which mutation to use
         version = self.get_gitlab_version()
-        print(f"GitLab version: {version}")
+        print(f"GitLab version: {version or 'Unknown'}")
+        
+        # Get available conversation types
+        conversation_types = self.get_available_conversation_types()
+        self._debug_print(f"Available conversation types: {conversation_types}")
+        
+        # Choose the appropriate conversation type
+        conversation_type = "DUO_CHAT_LEGACY"  # Default
+        if "DUO_CHAT" in conversation_types:
+            conversation_type = "DUO_CHAT"
+        
+        print(f"Using conversation type: {conversation_type}")
         
         # GraphQL mutation to send the prompt
         mutation = """
@@ -165,7 +237,7 @@ class GitLabAIChat:
             "question": message,
             "clientSubscriptionId": client_subscription_id,
             "platformOrigin": "vscode-extension",  # This matches what the extension uses
-            "conversationType": "DUO_CHAT"  # Use the standard DUO_CHAT type
+            "conversationType": conversation_type
         }
         
         # If we have a thread ID from a previous message, include it to continue the conversation
@@ -289,16 +361,22 @@ def setup_config() -> GitLabConfig:
     # Try to load from environment variables first
     gitlab_url = os.environ.get("GITLAB_URL", "")
     access_token = os.environ.get("GITLAB_TOKEN", "")
+    debug = os.environ.get("GITLAB_DEBUG", "").lower() in ["true", "1", "yes"]
     
     if not gitlab_url:
         gitlab_url = input("GitLab URL (e.g., https://gitlab.com): ").strip()
         
     if not access_token:
         access_token = input("GitLab Personal Access Token: ").strip()
+        
+    debug_input = input("Enable debug mode? (y/N): ").strip().lower()
+    if debug_input in ["y", "yes"]:
+        debug = True
     
     return GitLabConfig(
         gitlab_url=gitlab_url,
-        access_token=access_token
+        access_token=access_token,
+        debug=debug
     )
 
 
@@ -321,6 +399,11 @@ def interactive_chat(client: GitLabAIChat):
         if user_input.lower() == "clear":
             if client.clear_chat():
                 print("Chat conversation cleared")
+            continue
+            
+        if user_input.lower() == "debug":
+            client.debug = not client.debug
+            print(f"Debug mode {'enabled' if client.debug else 'disabled'}")
             continue
             
         response = client.send_message(user_input)
@@ -350,4 +433,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
