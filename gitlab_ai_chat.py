@@ -14,7 +14,7 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any
 
 # Suppress InsecureRequestWarning
 import urllib3
@@ -48,17 +48,8 @@ class GitLabAIChat:
         self.gitlab_version = None
         self.debug = config.debug
         
-    def _debug_print(self, *args, **kwargs):
-        """Print debug information if debug mode is enabled"""
-        if self.debug:
-            print("[DEBUG]", *args, **kwargs)
-        
     def _graphql_request(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         """Make a GraphQL request to GitLab API"""
-        if self.debug:
-            self._debug_print(f"GraphQL Query: {query}")
-            self._debug_print(f"Variables: {json.dumps(variables, indent=2)}")
-            
         try:
             response = requests.post(
                 self.graphql_url,
@@ -67,17 +58,8 @@ class GitLabAIChat:
                 verify=False  # Disable SSL verification
             )
             
-            if self.debug:
-                self._debug_print(f"Response Status: {response.status_code}")
-                self._debug_print(f"Response Headers: {response.headers}")
-                
             response.raise_for_status()
-            data = response.json()
-            
-            if self.debug:
-                self._debug_print(f"Response Data: {json.dumps(data, indent=2)}")
-                
-            return data
+            return response.json()
         except requests.RequestException as e:
             print(f"Request error: {e}")
             if hasattr(e, 'response') and e.response:
@@ -90,22 +72,7 @@ class GitLabAIChat:
         if self.gitlab_version:
             return self.gitlab_version
             
-        # First try the version field directly
-        query = """
-        query getVersion {
-          version
-        }
-        """
-        
-        data = self._graphql_request(query, {})
-        
-        if "errors" not in data:
-            version = data.get("data", {}).get("version")
-            if version:
-                self.gitlab_version = version
-                return version
-                
-        # If that fails, try the metadata.version field
+        # Try metadata.version field (works in newer GitLab versions)
         query = """
         query getMetadataVersion {
           metadata {
@@ -116,11 +83,27 @@ class GitLabAIChat:
         
         data = self._graphql_request(query, {})
         
+        if "errors" not in data:
+            version = data.get("data", {}).get("metadata", {}).get("version")
+            if version:
+                self.gitlab_version = version
+                return version
+                
+        # If that fails, try the version field directly (older versions)
+        query = """
+        query getVersion {
+          version
+        }
+        """
+        
+        data = self._graphql_request(query, {})
+        
         if "errors" in data:
-            print(f"Error getting GitLab version: {data['errors']}")
+            if self.debug:
+                print(f"Error getting GitLab version: {data['errors']}")
             return None
             
-        version = data.get("data", {}).get("metadata", {}).get("version")
+        version = data.get("data", {}).get("version")
         self.gitlab_version = version
         return version
 
@@ -137,7 +120,7 @@ class GitLabAIChat:
         data = self._graphql_request(query, {})
         
         if "errors" in data:
-            print(f"GraphQL errors: {json.dumps(data['errors'], indent=2)}")
+            print(f"Error checking chat availability: {json.dumps(data['errors'], indent=2)}")
             return False
             
         return data.get("data", {}).get("currentUser", {}).get("duoChatAvailable", False)
@@ -157,7 +140,8 @@ class GitLabAIChat:
         data = self._graphql_request(query, {})
         
         if "errors" in data:
-            print(f"Error getting current user: {data['errors']}")
+            if self.debug:
+                print(f"Error getting current user: {data['errors']}")
             return None
             
         return data.get("data", {}).get("currentUser")
@@ -178,7 +162,8 @@ class GitLabAIChat:
         data = self._graphql_request(query, {})
         
         if "errors" in data:
-            self._debug_print(f"Error getting conversation types: {data['errors']}")
+            if self.debug:
+                print(f"Error getting conversation types: {data['errors']}")
             # Default to DUO_CHAT_LEGACY as fallback
             return ["DUO_CHAT_LEGACY"]
             
@@ -193,11 +178,13 @@ class GitLabAIChat:
         
         # Get version to determine which mutation to use
         version = self.get_gitlab_version()
-        print(f"GitLab version: {version or 'Unknown'}")
+        if self.debug:
+            print(f"GitLab version: {version or 'Unknown'}")
         
         # Get available conversation types
         conversation_types = self.get_available_conversation_types()
-        self._debug_print(f"Available conversation types: {conversation_types}")
+        if self.debug:
+            print(f"Available conversation types: {conversation_types}")
         
         # Choose the appropriate conversation type
         conversation_type = "DUO_CHAT_LEGACY"  # Default
@@ -249,7 +236,7 @@ class GitLabAIChat:
         data = self._graphql_request(mutation, variables)
         
         if "errors" in data:
-            print(f"GraphQL errors: {json.dumps(data.get('errors', []), indent=2)}")
+            print(f"Error sending message: {json.dumps(data.get('errors', []), indent=2)}")
             return None
             
         ai_action = data.get("data", {}).get("aiAction", {})
@@ -257,16 +244,19 @@ class GitLabAIChat:
         
         if not request_id:
             print("No request ID returned")
-            print(f"Response: {json.dumps(data, indent=2)}")
+            if self.debug:
+                print(f"Response: {json.dumps(data, indent=2)}")
             return None
             
         # Store the thread ID for future messages in the same conversation
         if "threadId" in ai_action and ai_action["threadId"]:
             self.thread_id = ai_action["threadId"]
-            print(f"Thread ID: {self.thread_id}")
+            if self.debug:
+                print(f"Thread ID: {self.thread_id}")
             
         self.request_ids.append(request_id)
-        print(f"Request ID: {request_id}")
+        if self.debug:
+            print(f"Request ID: {request_id}")
         
         # Now poll for the response
         return self._poll_for_response(request_id)
@@ -302,7 +292,7 @@ class GitLabAIChat:
                 print(".", end="", flush=True)
                 
             if "errors" in data:
-                print(f"\nGraphQL errors: {json.dumps(data.get('errors', []), indent=2)}")
+                print(f"\nError polling for response: {json.dumps(data.get('errors', []), indent=2)}")
                 time.sleep(interval)
                 continue
                 
@@ -383,7 +373,7 @@ def setup_config() -> GitLabConfig:
 def interactive_chat(client: GitLabAIChat):
     """Run an interactive chat session with GitLab AI"""
     print("\n===== GitLab AI Chat =====")
-    print("Type 'exit' to quit, 'clear' to start a new conversation\n")
+    print("Type 'exit' to quit, 'clear' to start a new conversation, 'debug' to toggle debug mode\n")
     
     # Get user info
     user = client.get_current_user()
