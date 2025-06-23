@@ -28,13 +28,13 @@ PLATFORM_ORIGIN = 'vs_code_extension'
 SPECIAL_MESSAGES = {
     'RESET': '/reset',
     'CLEAR': '/clear',
-    'CLEAN': '/clean'  # Deprecated, but remains for older versions of GitLab
 }
 
-# Minimum version constants
-MINIMUM_PLATFORM_ORIGIN_FIELD_VERSION = '17.3.0'
-MINIMUM_ADDITIONAL_CONTEXT_FIELD_VERSION = '17.5.0-pre'
-MINIMUM_CONVERSATION_TYPE_VERSION = '17.10.0-pre'
+# API polling settings
+API_POLLING = {
+    'interval': 2,  # seconds
+    'max_retries': 30,
+}
 
 
 @dataclass
@@ -59,8 +59,8 @@ class GitLabAIChat:
         }
         self.thread_id = None
         self.request_ids = []
-        self.gitlab_version = None
         self.debug = config.debug
+        self.current_user_id = None
         
     def _graphql_request(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         """Make a GraphQL request to GitLab API"""
@@ -73,7 +73,8 @@ class GitLabAIChat:
                 self.graphql_url,
                 headers=self.headers,
                 json={"query": query, "variables": variables},
-                verify=False  # Disable SSL verification
+                verify=False,  # Disable SSL verification
+                timeout=30  # Add timeout to prevent hanging requests
             )
             
             if self.debug:
@@ -92,72 +93,6 @@ class GitLabAIChat:
                 print(f"Response status: {e.response.status_code}")
                 print(f"Response body: {e.response.text}")
             return {"errors": [{"message": str(e)}]}
-
-    def version_gte(self, version: str, min_version: str) -> bool:
-        """Check if GitLab version is greater than or equal to minimum version"""
-        if not version or not min_version:
-            return False
-            
-        # Simple version comparison - could be improved for more complex version strings
-        v_parts = version.split('.')
-        min_parts = min_version.split('.')
-        
-        # Compare major version
-        if int(v_parts[0]) > int(min_parts[0]):
-            return True
-        if int(v_parts[0]) < int(min_parts[0]):
-            return False
-            
-        # Compare minor version
-        if int(v_parts[1]) > int(min_parts[1]):
-            return True
-        if int(v_parts[1]) < int(min_parts[1]):
-            return False
-            
-        # Compare patch version (ignoring any suffixes like -pre)
-        v_patch = v_parts[2].split('-')[0]
-        min_patch = min_parts[2].split('-')[0]
-        return int(v_patch) >= int(min_patch)
-
-    def get_gitlab_version(self) -> Optional[str]:
-        """Get the GitLab instance version"""
-        if self.gitlab_version:
-            return self.gitlab_version
-            
-        # Try metadata.version field (works in newer GitLab versions)
-        query = """
-        query getMetadataVersion {
-          metadata {
-            version
-          }
-        }
-        """
-        
-        data = self._graphql_request(query, {})
-        
-        if "errors" not in data:
-            version = data.get("data", {}).get("metadata", {}).get("version")
-            if version:
-                self.gitlab_version = version
-                return version
-                
-        # If that fails, try the version field directly (older versions)
-        query = """
-        query getVersion {
-          version
-        }
-        """
-        
-        data = self._graphql_request(query, {})
-        
-        if "errors" in data:
-            if self.debug:
-                print(f"Error getting GitLab version: {data['errors']}")
-            return None
-            
-        version = data.get("data", {}).get("version")
-        self.gitlab_version = version
-        return version
 
     def check_chat_available(self) -> bool:
         """Check if GitLab AI chat is available for the current user"""
@@ -195,8 +130,12 @@ class GitLabAIChat:
             if self.debug:
                 print(f"Error getting current user: {data['errors']}")
             return None
+        
+        user_data = data.get("data", {}).get("currentUser")
+        if user_data and "id" in user_data:
+            self.current_user_id = user_data["id"]
             
-        return data.get("data", {}).get("currentUser")
+        return user_data
 
     def get_available_conversation_types(self) -> List[str]:
         """Get the available conversation types for the current GitLab instance"""
@@ -222,198 +161,60 @@ class GitLabAIChat:
         enum_values = data.get("data", {}).get("__type", {}).get("enumValues", [])
         return [enum_value["name"] for enum_value in enum_values] if enum_values else ["DUO_CHAT_LEGACY"]
 
-    def get_chat_mutation(self) -> Dict[str, Any]:
-        """Get the appropriate chat mutation based on GitLab version"""
-        version = self.get_gitlab_version()
-        
-        # Default to basic template for older versions
-        if not version:
-            return {
-                "query": """
-                mutation chat(
-                  $question: String!
-                  $resourceId: AiModelID
-                  $currentFileContext: AiCurrentFileInput
-                  $clientSubscriptionId: String
-                ) {
-                  aiAction(
-                    input: {
-                      chat: { resourceId: $resourceId, content: $question, currentFile: $currentFileContext }
-                      clientSubscriptionId: $clientSubscriptionId
-                    }
-                  ) {
-                    requestId
-                    errors
-                  }
-                }
-                """,
-                "defaultVariables": {}
-            }
-            
-        # For GitLab 17.10.0 and later
-        if self.version_gte(version, MINIMUM_CONVERSATION_TYPE_VERSION):
-            return {
-                "query": """
-                mutation chat(
-                  $question: String!
-                  $resourceId: AiModelID
-                  $currentFileContext: AiCurrentFileInput
-                  $clientSubscriptionId: String
-                  $platformOrigin: String!
-                  $additionalContext: [AiAdditionalContextInput!]
-                  $conversationType: AiConversationsThreadsConversationType
-                  $threadId: AiConversationThreadID
-                ) {
-                  aiAction(
-                    input: {
-                      chat: {
-                        resourceId: $resourceId
-                        content: $question
-                        currentFile: $currentFileContext
-                        additionalContext: $additionalContext
-                      }
-                      clientSubscriptionId: $clientSubscriptionId
-                      platformOrigin: $platformOrigin
-                      conversationType: $conversationType
-                      threadId: $threadId
-                    }
-                  ) {
-                    requestId
-                    errors
-                    threadId
-                  }
-                }
-                """,
-                "defaultVariables": {
-                    "platformOrigin": PLATFORM_ORIGIN
-                }
-            }
-            
-        # For GitLab 17.5.0 and later
-        if self.version_gte(version, MINIMUM_ADDITIONAL_CONTEXT_FIELD_VERSION):
-            return {
-                "query": """
-                mutation chat(
-                  $question: String!
-                  $resourceId: AiModelID
-                  $currentFileContext: AiCurrentFileInput
-                  $clientSubscriptionId: String
-                  $platformOrigin: String!
-                  $additionalContext: [AiAdditionalContextInput!]
-                ) {
-                  aiAction(
-                    input: {
-                      chat: {
-                        resourceId: $resourceId
-                        content: $question
-                        currentFile: $currentFileContext
-                        additionalContext: $additionalContext
-                      }
-                      clientSubscriptionId: $clientSubscriptionId
-                      platformOrigin: $platformOrigin
-                    }
-                  ) {
-                    requestId
-                    errors
-                  }
-                }
-                """,
-                "defaultVariables": {
-                    "platformOrigin": PLATFORM_ORIGIN
-                }
-            }
-            
-        # For GitLab 17.3.0 and later
-        if self.version_gte(version, MINIMUM_PLATFORM_ORIGIN_FIELD_VERSION):
-            return {
-                "query": """
-                mutation chat(
-                  $question: String!
-                  $resourceId: AiModelID
-                  $currentFileContext: AiCurrentFileInput
-                  $clientSubscriptionId: String
-                  $platformOrigin: String!
-                ) {
-                  aiAction(
-                    input: {
-                      chat: { resourceId: $resourceId, content: $question, currentFile: $currentFileContext }
-                      clientSubscriptionId: $clientSubscriptionId
-                      platformOrigin: $platformOrigin
-                    }
-                  ) {
-                    requestId
-                    errors
-                  }
-                }
-                """,
-                "defaultVariables": {
-                    "platformOrigin": PLATFORM_ORIGIN
-                }
-            }
-            
-        # For GitLab 17.2 and earlier
-        return {
-            "query": """
-            mutation chat(
-              $question: String!
-              $resourceId: AiModelID
-              $currentFileContext: AiCurrentFileInput
-              $clientSubscriptionId: String
-            ) {
-              aiAction(
-                input: {
-                  chat: { resourceId: $resourceId, content: $question, currentFile: $currentFileContext }
-                  clientSubscriptionId: $clientSubscriptionId
-                }
-              ) {
-                requestId
-                errors
-              }
-            }
-            """,
-            "defaultVariables": {}
-        }
-
     def send_message(self, message: str) -> Optional[str]:
         """
         Send a message to GitLab AI chat and return the response
         """
         client_subscription_id = str(uuid.uuid4())
         
-        # Get version to determine which mutation to use
-        version = self.get_gitlab_version()
-        print(f"GitLab version: {version or 'Unknown'}")
+        # Get available conversation types
+        conversation_types = self.get_available_conversation_types()
+        if self.debug:
+            print(f"Available conversation types: {conversation_types}")
         
-        # Get the appropriate mutation based on version
-        mutation_template = self.get_chat_mutation()
-        mutation = mutation_template["query"]
-        default_variables = mutation_template["defaultVariables"]
+        # Choose the appropriate conversation type
+        conversation_type = "DUO_CHAT_LEGACY"  # Default
+        if "DUO_CHAT" in conversation_types:
+            conversation_type = "DUO_CHAT"
+        elif "AGENTIC_CHAT" in conversation_types:
+            conversation_type = "AGENTIC_CHAT"
+                
+        print(f"Using conversation type: {conversation_type}")
         
-        # Get available conversation types if needed
-        conversation_types = []
-        if self.version_gte(version or "", MINIMUM_CONVERSATION_TYPE_VERSION):
-            conversation_types = self.get_available_conversation_types()
-            if self.debug:
-                print(f"Available conversation types: {conversation_types}")
+        # GraphQL mutation for GitLab 17.11.3-ee
+        mutation = """
+        mutation chat(
+          $question: String!
+          $clientSubscriptionId: String
+          $platformOrigin: String!
+          $conversationType: AiConversationsThreadsConversationType
+          $threadId: AiConversationThreadID
+        ) {
+          aiAction(
+            input: {
+              chat: { 
+                content: $question
+              }
+              clientSubscriptionId: $clientSubscriptionId
+              platformOrigin: $platformOrigin
+              conversationType: $conversationType
+              threadId: $threadId
+            }
+          ) {
+            requestId
+            errors
+            threadId
+          }
+        }
+        """
         
         # Base variables
         variables = {
             "question": message,
             "clientSubscriptionId": client_subscription_id,
-            **default_variables
+            "platformOrigin": PLATFORM_ORIGIN,
+            "conversationType": conversation_type
         }
-        
-        # Add conversation type if needed
-        if self.version_gte(version or "", MINIMUM_CONVERSATION_TYPE_VERSION):
-            # Choose the appropriate conversation type
-            conversation_type = "DUO_CHAT_LEGACY"  # Default
-            if "DUO_CHAT" in conversation_types:
-                conversation_type = "DUO_CHAT"
-            elif "AGENTIC_CHAT" in conversation_types:
-                conversation_type = "AGENTIC_CHAT"
-                
-            print(f"Using conversation type: {conversation_type}")
-            variables["conversationType"] = conversation_type
         
         # If we have a thread ID from a previous message, include it to continue the conversation
         if self.thread_id:
@@ -446,84 +247,223 @@ class GitLabAIChat:
         if self.debug:
             print(f"Request ID: {request_id}")
         
-        # Now poll for the response
-        return self._poll_for_response(request_id)
+        # Try to use websocket connection first if supported
+        if self.current_user_id:
+            try:
+                response = self._try_websocket_connection(request_id, client_subscription_id)
+                if response:
+                    return response
+            except Exception as e:
+                if self.debug:
+                    print(f"Websocket connection failed: {str(e)}")
+                print("Falling back to polling for response...")
         
-    def _poll_for_response(self, request_id: str, max_retries: int = 60, interval: int = 1) -> Optional[str]:
-        """Poll for the AI response using the request ID"""
-        # Determine which query to use based on version
-        version = self.get_gitlab_version()
+        # Fall back to polling
+        return self._pull_ai_message(request_id, "ASSISTANT")
         
-        if self.version_gte(version or "", MINIMUM_ADDITIONAL_CONTEXT_FIELD_VERSION):
-            query = """
-            query getAiMessages($requestIds: [ID!], $roles: [AiMessageRole!]) {
-              aiMessages(requestIds: $requestIds, roles: $roles) {
-                nodes {
-                  requestId
-                  role
-                  content
-                  contentHtml
-                  timestamp
-                  errors
-                  extras {
-                    sources
-                    additionalContext {
-                      id
-                      category
-                      metadata
-                    }
-                  }
+    def _try_websocket_connection(self, request_id: str, subscription_id: str) -> Optional[str]:
+        """Try to use websocket connection to get streaming response"""
+        # This is a placeholder for websocket implementation
+        # In a real implementation, you would use a websocket library to connect to GitLab's ActionCable
+        # and subscribe to the GraphqlChannel with the aiCompletionResponse subscription
+        return None
+        
+    def _pull_ai_message(self, request_id: str, role: str) -> Optional[str]:
+        """Pull AI message using the pull handler pattern from the VS Code extension"""
+        print("Waiting for response", end="", flush=True)
+        
+        for retry in range(API_POLLING['max_retries']):
+            print(".", end="", flush=True)
+            
+            response = self._get_ai_message(request_id, role)
+            
+            if response:
+                print("\n")  # Add a newline after the progress dots
+                return response
+                
+            # If we've tried several times, try alternative approaches
+            if retry == 10:
+                print("\nTrying alternative approach...")
+                alt_response = self._try_alternative_approaches(request_id)
+                if alt_response:
+                    return alt_response
+                    
+            time.sleep(API_POLLING['interval'])
+            
+        print("\nReached timeout while fetching response.")
+        return None
+        
+    def _get_ai_message(self, request_id: str, role: str) -> Optional[str]:
+        """Get AI message from GitLab API"""
+        query = """
+        query getAiMessages($requestIds: [ID!], $roles: [AiMessageRole!]) {
+          aiMessages(requestIds: $requestIds, roles: $roles) {
+            nodes {
+              requestId
+              role
+              content
+              contentHtml
+              timestamp
+              errors
+              extras {
+                sources
+                additionalContext {
+                  id
+                  category
+                  metadata
                 }
               }
             }
-            """
-        else:
-            query = """
-            query getAiMessages($requestIds: [ID!], $roles: [AiMessageRole!]) {
-              aiMessages(requestIds: $requestIds, roles: $roles) {
-                nodes {
-                  requestId
-                  role
-                  content
-                  contentHtml
-                  timestamp
-                  errors
-                  extras {
-                    sources
-                  }
-                }
-              }
-            }
-            """
+          }
+        }
+        """
         
         variables = {
             "requestIds": [request_id],
-            "roles": ["ASSISTANT"]  # Only get assistant responses
+            "roles": [role]
         }
         
-        print("Waiting for response", end="", flush=True)
-        
-        for i in range(max_retries):
+        try:
             data = self._graphql_request(query, variables)
             
-            if i % 5 == 0:
-                print(".", end="", flush=True)
-                
             if "errors" in data:
-                print(f"\nError polling for response: {json.dumps(data.get('errors', []), indent=2)}")
-                time.sleep(interval)
-                continue
+                if self.debug:
+                    print(f"\nGraphQL errors: {json.dumps(data.get('errors', []), indent=2)}")
+                return None
                 
             nodes = data.get("data", {}).get("aiMessages", {}).get("nodes", [])
             
             for node in nodes:
-                if node.get("role") == "assistant" and node.get("content"):
-                    print("\n")  # Add a newline after the progress dots
+                if node.get("role") == role.lower() and node.get("content"):
                     return node.get("content")
+                    
+            return None
+        except Exception as e:
+            if self.debug:
+                print(f"\nError getting AI message: {str(e)}")
+            return None
             
-            time.sleep(interval)
+    def _try_alternative_approaches(self, request_id: str) -> Optional[str]:
+        """Try alternative approaches to get the AI response"""
+        # Try different query structures
+        approaches = [
+            self._try_direct_ai_message_query,
+            self._try_thread_messages_query,
+            self._try_conversation_query
+        ]
+        
+        for approach in approaches:
+            try:
+                response = approach(request_id)
+                if response:
+                    return response
+            except Exception as e:
+                if self.debug:
+                    print(f"Alternative approach error: {str(e)}")
+                    
+        return None
+        
+    def _try_direct_ai_message_query(self, request_id: str) -> Optional[str]:
+        """Try querying the AI message directly by ID"""
+        query = """
+        query getAiMessage($id: ID!) {
+          aiMessage(id: $id) {
+            requestId
+            role
+            content
+            timestamp
+            errors
+          }
+        }
+        """
+        
+        variables = {
+            "id": request_id
+        }
+        
+        data = self._graphql_request(query, variables)
+        
+        if "errors" in data:
+            return None
             
-        print("\nTimed out waiting for response")
+        ai_message = data.get("data", {}).get("aiMessage", {})
+        if ai_message and ai_message.get("role") == "assistant" and ai_message.get("content"):
+            return ai_message.get("content")
+            
+        return None
+        
+    def _try_thread_messages_query(self, request_id: str) -> Optional[str]:
+        """Try querying the thread messages if we have a thread ID"""
+        if not self.thread_id:
+            return None
+            
+        query = """
+        query getThreadMessages($threadId: AiConversationThreadID!) {
+          aiConversationThread(id: $threadId) {
+            messages {
+              nodes {
+                requestId
+                role
+                content
+                timestamp
+              }
+            }
+          }
+        }
+        """
+        
+        variables = {
+            "threadId": self.thread_id
+        }
+        
+        data = self._graphql_request(query, variables)
+        
+        if "errors" in data:
+            return None
+            
+        nodes = data.get("data", {}).get("aiConversationThread", {}).get("messages", {}).get("nodes", [])
+        
+        # Find the most recent assistant message
+        assistant_messages = [node for node in nodes if node.get("role") == "assistant"]
+        if assistant_messages:
+            # Sort by timestamp (newest first)
+            assistant_messages.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+            return assistant_messages[0].get("content")
+            
+        return None
+        
+    def _try_conversation_query(self, request_id: str) -> Optional[str]:
+        """Try querying the conversation if we have a thread ID"""
+        if not self.thread_id:
+            return None
+            
+        query = """
+        query getConversation($threadId: AiConversationThreadID!) {
+          aiConversationThread(id: $threadId) {
+            conversation {
+              lastMessage {
+                role
+                content
+              }
+            }
+          }
+        }
+        """
+        
+        variables = {
+            "threadId": self.thread_id
+        }
+        
+        data = self._graphql_request(query, variables)
+        
+        if "errors" in data:
+            return None
+            
+        last_message = data.get("data", {}).get("aiConversationThread", {}).get("conversation", {}).get("lastMessage", {})
+        
+        if last_message and last_message.get("role") == "assistant" and last_message.get("content"):
+            return last_message.get("content")
+            
         return None
 
     def clear_chat(self) -> bool:
@@ -533,7 +473,12 @@ class GitLabAIChat:
             return True
             
         # Use the special message for clearing chat
-        return self.send_message(SPECIAL_MESSAGES["CLEAR"]) is not None
+        result = self.send_message(SPECIAL_MESSAGES["CLEAR"])
+        if result is not None:
+            self.thread_id = None
+            self.request_ids = []
+            return True
+        return False
 
 
 def setup_config() -> GitLabConfig:
