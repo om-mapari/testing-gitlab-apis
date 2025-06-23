@@ -12,8 +12,13 @@ import os
 import sys
 import time
 import uuid
+import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
+
+# Suppress InsecureRequestWarning
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import requests
 
@@ -37,9 +42,49 @@ class GitLabAIChat:
             "Authorization": f"Bearer {config.access_token}",
             "Content-Type": "application/json"
         }
-        self.conversation_id = None
-        self.request_ids = []
         self.thread_id = None
+        self.request_ids = []
+        self.gitlab_version = None
+        
+    def _graphql_request(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+        """Make a GraphQL request to GitLab API"""
+        try:
+            response = requests.post(
+                self.graphql_url,
+                headers=self.headers,
+                json={"query": query, "variables": variables},
+                verify=False  # Disable SSL verification
+            )
+            
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            print(f"Request error: {e}")
+            if hasattr(e, 'response') and e.response:
+                print(f"Response status: {e.response.status_code}")
+                print(f"Response body: {e.response.text}")
+            return {"errors": [{"message": str(e)}]}
+
+    def get_gitlab_version(self) -> Optional[str]:
+        """Get the GitLab instance version"""
+        if self.gitlab_version:
+            return self.gitlab_version
+            
+        query = """
+        query getVersion {
+          version
+        }
+        """
+        
+        data = self._graphql_request(query, {})
+        
+        if "errors" in data:
+            print(f"Error getting GitLab version: {data['errors']}")
+            return None
+            
+        version = data.get("data", {}).get("version")
+        self.gitlab_version = version
+        return version
 
     def check_chat_available(self) -> bool:
         """Check if GitLab AI chat is available for the current user"""
@@ -51,29 +96,43 @@ class GitLabAIChat:
         }
         """
         
-        response = requests.post(
-            self.graphql_url,
-            headers=self.headers,
-            json={"query": query}
-        )
+        data = self._graphql_request(query, {})
         
-        if response.status_code != 200:
-            print(f"Error checking chat availability: {response.status_code}")
-            print(response.text)
-            return False
-            
-        data = response.json()
         if "errors" in data:
-            print(f"GraphQL errors: {data['errors']}")
+            print(f"GraphQL errors: {json.dumps(data['errors'], indent=2)}")
             return False
             
         return data.get("data", {}).get("currentUser", {}).get("duoChatAvailable", False)
+
+    def get_current_user(self) -> Optional[Dict[str, Any]]:
+        """Get the current user information"""
+        query = """
+        query getCurrentUser {
+          currentUser {
+            id
+            username
+            name
+          }
+        }
+        """
+        
+        data = self._graphql_request(query, {})
+        
+        if "errors" in data:
+            print(f"Error getting current user: {data['errors']}")
+            return None
+            
+        return data.get("data", {}).get("currentUser")
 
     def send_message(self, message: str) -> Optional[str]:
         """
         Send a message to GitLab AI chat and return the response
         """
         client_subscription_id = str(uuid.uuid4())
+        
+        # Get version to determine which mutation to use
+        version = self.get_gitlab_version()
+        print(f"GitLab version: {version}")
         
         # GraphQL mutation to send the prompt
         mutation = """
@@ -115,21 +174,10 @@ class GitLabAIChat:
         
         print("Sending message to GitLab AI...")
         
-        response = requests.post(
-            self.graphql_url,
-            headers=self.headers,
-            json={"query": mutation, "variables": variables}
-        )
-        
-        if response.status_code != 200:
-            print(f"Error sending message: {response.status_code}")
-            print(response.text)
-            return None
-            
-        data = response.json()
+        data = self._graphql_request(mutation, variables)
         
         if "errors" in data:
-            print(f"GraphQL errors: {json.dumps(data['errors'], indent=2)}")
+            print(f"GraphQL errors: {json.dumps(data.get('errors', []), indent=2)}")
             return None
             
         ai_action = data.get("data", {}).get("aiAction", {})
@@ -143,8 +191,10 @@ class GitLabAIChat:
         # Store the thread ID for future messages in the same conversation
         if "threadId" in ai_action and ai_action["threadId"]:
             self.thread_id = ai_action["threadId"]
+            print(f"Thread ID: {self.thread_id}")
             
         self.request_ids.append(request_id)
+        print(f"Request ID: {request_id}")
         
         # Now poll for the response
         return self._poll_for_response(request_id)
@@ -174,24 +224,13 @@ class GitLabAIChat:
         print("Waiting for response", end="", flush=True)
         
         for i in range(max_retries):
-            response = requests.post(
-                self.graphql_url,
-                headers=self.headers,
-                json={"query": query, "variables": variables}
-            )
+            data = self._graphql_request(query, variables)
             
             if i % 5 == 0:
                 print(".", end="", flush=True)
                 
-            if response.status_code != 200:
-                print(f"\nError polling for response: {response.status_code}")
-                print(response.text)
-                time.sleep(interval)
-                continue
-                
-            data = response.json()
             if "errors" in data:
-                print(f"\nGraphQL errors: {data['errors']}")
+                print(f"\nGraphQL errors: {json.dumps(data.get('errors', []), indent=2)}")
                 time.sleep(interval)
                 continue
                 
@@ -206,6 +245,41 @@ class GitLabAIChat:
             
         print("\nTimed out waiting for response")
         return None
+
+    def clear_chat(self) -> bool:
+        """Clear the current chat conversation"""
+        if not self.thread_id:
+            print("No active conversation to clear")
+            return True
+            
+        mutation = """
+        mutation clearChat($threadId: AiConversationThreadID) {
+          aiAction(
+            input: {
+              chat: { content: "/clear" }
+              threadId: $threadId
+              platformOrigin: "vscode-extension"
+            }
+          ) {
+            requestId
+            errors
+          }
+        }
+        """
+        
+        variables = {
+            "threadId": self.thread_id
+        }
+        
+        data = self._graphql_request(mutation, variables)
+        
+        if "errors" in data:
+            print(f"Error clearing chat: {data['errors']}")
+            return False
+            
+        self.thread_id = None
+        self.request_ids = []
+        return True
 
 
 def setup_config() -> GitLabConfig:
@@ -231,12 +305,23 @@ def setup_config() -> GitLabConfig:
 def interactive_chat(client: GitLabAIChat):
     """Run an interactive chat session with GitLab AI"""
     print("\n===== GitLab AI Chat =====")
-    print("Type 'exit' to quit\n")
+    print("Type 'exit' to quit, 'clear' to start a new conversation\n")
+    
+    # Get user info
+    user = client.get_current_user()
+    if user:
+        print(f"Logged in as: {user.get('name')} (@{user.get('username')})")
     
     while True:
         user_input = input("\nYou: ")
+        
         if user_input.lower() in ["exit", "quit", "stop"]:
             break
+            
+        if user_input.lower() == "clear":
+            if client.clear_chat():
+                print("Chat conversation cleared")
+            continue
             
         response = client.send_message(user_input)
         if response:
